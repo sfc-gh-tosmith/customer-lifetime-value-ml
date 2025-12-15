@@ -34,11 +34,14 @@ graph TB
         
         E2 --> F3[(ENGAGEMENT_FEATURES<br/>Feature View<br/>- WEBSITE_VISITS<br/>- EMAIL_OPENS<br/>- EMAIL_CLICKS<br/>Refresh: 1 day)]
         
+        E2 --> F5[(DERIVED_FEATURES<br/>Feature View<br/>- RFM_SCORE<br/>- LIFECYCLE_STAGE<br/>- VELOCITIES<br/>Refresh: 1 day)]
+        
         E1 --> |Calculate Target| F4[(CONTINUOUS_CUSTOMERS_PROFILE_WITH_TARGET<br/>+ FUTURE_12M_LTV)]
         
         F1 --> G1
         F2 --> G1
         F3 --> G1
+        F5 --> G1
         F4 --> G1
         
         G1[(CONTINUOUS_TRAINING_DATA_WITH_TARGET<br/>Feature Store Output)]
@@ -46,27 +49,26 @@ graph TB
     
     subgraph "CONTINUOUS PATH - TRAINING & INFERENCE"
         G1 --> H1[train_continuous_model.ipynb]
-        H1 --> |Advanced Features| H2[Derived:<br/>- RFM scores<br/>- Lifecycle stage<br/>- Velocity indicators<br/>- Cohort comparisons]
-        H2 --> |XGBoost + HPO| H3[CONTINUOUS_CLV_MODEL<br/>Version: V1<br/>Target: 12M LTV]
+        H1 --> |XGBoost + HPO| H3[CONTINUOUS_CLV_MODEL<br/>Version: V1<br/>Target: 12M LTV]
         H3 --> I1[(ML Registry)]
         
-        H1 --> |Inference Setup| I2[Staging Tables:<br/>TRANSACTIONS_STAGING<br/>INTERACTIONS_STAGING]
-        I2 --> |Merge| B2
-        I2 --> |Merge| B3
-        I2 --> |Merge| B4
+        B3 -.->|New Data<br/>INSERT/MERGE| B3
+        B4 -.->|New Data<br/>INSERT/MERGE| B4
         
         B2 -.->|Auto Refresh| F1
         B3 -.->|Auto Refresh| F1
         B3 -.->|Auto Refresh| F2
         B4 -.->|Auto Refresh| F3
+        F1 -.->|Auto Refresh| F5
+        F2 -.->|Auto Refresh| F5
+        F3 -.->|Auto Refresh| F5
         
-        H1 --> |fs.retrieve_feature_values| I3[Read Feature Views:<br/>RFM_FEATURES<br/>PURCHASE_PATTERNS<br/>ENGAGEMENT_FEATURES]
-        F1 -.-> I3
-        F2 -.-> I3
-        F3 -.-> I3
-        
-        I3 --> I4[Model Scoring<br/>Python Pipeline]
-        I4 --> I5[(CONTINUOUS_CLV_PREDICTIONS<br/>Table<br/>Scheduled Update)]
+        F1 -.->|SQL Query| I6
+        F2 -.->|SQL Query| I6
+        F3 -.->|SQL Query| I6
+        F5 -.->|SQL Query| I6
+        I6[(CONTINUOUS_CLV_PREDICTIONS_AUTO<br/>Dynamic Table<br/>Refresh: 1 hour)]
+        H3 -.->|MODEL!PREDICT| I6
     end
     
     subgraph "MODEL DEPLOYMENT"
@@ -86,6 +88,7 @@ graph TB
     style F1 fill:#ffe6f0
     style F2 fill:#ffe6f0
     style F3 fill:#ffe6f0
+    style F5 fill:#ffe6f0
     style F4 fill:#fff4e6
     style G1 fill:#e6fff0
     style C3 fill:#ffcccc
@@ -93,7 +96,7 @@ graph TB
     style D1 fill:#ccffcc
     style I1 fill:#ccffcc
     style D3 fill:#ffffcc
-    style I5 fill:#ffffcc
+    style I6 fill:#ffffcc
 ```
 
 ## Data Flow Summary
@@ -144,38 +147,33 @@ graph TB
      - `RFM_FEATURES`: Recency, Frequency, Monetary, Tenure
      - `PURCHASE_PATTERNS`: Category diversity, 30d/90d windows
      - `ENGAGEMENT_FEATURES`: Website, email, support metrics
+     - `DERIVED_FEATURES`: RFM scores, lifecycle stages, velocities, cohort comparisons
    - Transformations:
      - Aggregate transactions by customer
      - Calculate time windows (30d, 90d)
      - Compute engagement rates
+     - **All derived features in Snowpark SQL** (quintiles, velocities, ratios)
      - Join multiple data sources
    - Target Creation: `FUTURE_12M_LTV` (synthetic formula)
    - Output: `CONTINUOUS_TRAINING_DATA_WITH_TARGET`
 
 3. **Model Training** (`train_continuous_model.ipynb`)
-   - Input: `CONTINUOUS_TRAINING_DATA_WITH_TARGET`
-   - Additional Transformations:
-     - RFM score normalization (quintiles)
-     - Lifecycle stage classification
-     - Velocity indicators (30d vs 90d trends)
-     - Cohort-based benchmarking
-     - Engagement ratios
+   - Input: `CONTINUOUS_TRAINING_DATA_WITH_TARGET` (ALL features from Feature Store)
+   - **No additional feature computation** - all features come from Feature Store!
    - Output: `CONTINUOUS_CLV_MODEL` (Snowflake ML Registry)
    - Metrics: RMSE, MAE, R², MAPE
    - HPO: 20 trials, Bayesian optimization
 
-4. **Inference** (Feature Store Integration)
-   - Staging tables for new data:
-     - `CONTINUOUS_TRANSACTIONS_STAGING`
-     - `CONTINUOUS_INTERACTIONS_STAGING`
-   - New data merged into base tables → Feature views auto-refresh (1 day)
-   - Inference via `fs.retrieve_feature_values()` using **same** feature views as training:
-     - `RFM_FEATURES` (v1.0)
-     - `PURCHASE_PATTERNS` (v1.0)
-     - `ENGAGEMENT_FEATURES` (v1.0)
-   - Model scoring in Python with full pipeline
-   - Output: `CONTINUOUS_CLV_PREDICTIONS` table
-   - **Key benefit**: Zero training-serving skew - identical feature logic
+4. **Inference** (Fully Automatic Dynamic Table)
+   - New data → Direct INSERT/MERGE into base tables:
+     - `CONTINUOUS_TRANSACTIONS`
+     - `CONTINUOUS_INTERACTIONS`
+   - Feature views auto-refresh (1 day) → All 4 views update
+   - **Dynamic Table** `CONTINUOUS_CLV_PREDICTIONS_AUTO`:
+     - Queries all 4 Feature Views (RFM, PURCHASE_PATTERNS, ENGAGEMENT, DERIVED)
+     - Calls `MODEL!PREDICT()` with ALL features in SQL
+     - Auto-refresh: 1 hour lag
+   - **Key benefit**: Fully automatic, zero Python execution, guaranteed consistency
 
 ---
 
@@ -194,14 +192,13 @@ graph TB
 - **Regularization**: Tree depth limits, subsampling, L1/L2 penalties
 - **Deployment**: Both WAREHOUSE (SQL) and SPCS (Python) platforms
 
-### Inference Pattern (Feature Store)
-- **Staging Tables**: Ingest new transaction/interaction data
-- **Base Tables**: Merge/append staging data to CONTINUOUS_TRANSACTIONS, CONTINUOUS_INTERACTIONS
-- **Feature Store**: Feature views automatically refresh (1-day schedule)
-- **Retrieve Features**: `fs.retrieve_feature_values()` using same feature views as training
-- **Model Scoring**: Python pipeline prediction (scheduled notebook execution)
-- **Output Table**: CONTINUOUS_CLV_PREDICTIONS with predictions and timestamps
-- **Consistency**: Guaranteed identical features for training and inference
+### Inference Pattern (Fully Automatic)
+- **New Data**: Direct INSERT/MERGE into CONTINUOUS_TRANSACTIONS, CONTINUOUS_INTERACTIONS
+- **Feature Store**: All 4 feature views automatically refresh (1-day schedule)
+- **Dynamic Table**: Queries Feature Views + calls MODEL!PREDICT() in SQL
+- **Output Table**: CONTINUOUS_CLV_PREDICTIONS_AUTO with predictions and timestamps
+- **Refresh**: 1-hour lag, fully automatic
+- **Consistency**: Guaranteed identical features - single source of truth in Feature Store
 
 ---
 
