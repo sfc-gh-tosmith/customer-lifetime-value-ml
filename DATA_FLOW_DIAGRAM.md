@@ -44,16 +44,29 @@ graph TB
         G1[(CONTINUOUS_TRAINING_DATA_WITH_TARGET<br/>Feature Store Output)]
     end
     
-    subgraph "CONTINUOUS PATH - TRAINING"
+    subgraph "CONTINUOUS PATH - TRAINING & INFERENCE"
         G1 --> H1[train_continuous_model.ipynb]
         H1 --> |Advanced Features| H2[Derived:<br/>- RFM scores<br/>- Lifecycle stage<br/>- Velocity indicators<br/>- Cohort comparisons]
         H2 --> |XGBoost + HPO| H3[CONTINUOUS_CLV_MODEL<br/>Version: V1<br/>Target: 12M LTV]
         H3 --> I1[(ML Registry)]
-        H3 --> I2[(CONTINUOUS_TRANSACTIONS_STAGING)]
-        H3 --> I3[(CONTINUOUS_INTERACTIONS_STAGING)]
-        I2 --> I4[(CONTINUOUS_CUSTOMER_FEATURES<br/>Dynamic Table<br/>Incremental Refresh<br/>1 hour)]
-        I3 --> I4
-        I4 --> I5[(CONTINUOUS_CLV_PREDICTIONS<br/>Dynamic Table<br/>Refresh: 1 hour)]
+        
+        H1 --> |Inference Setup| I2[Staging Tables:<br/>TRANSACTIONS_STAGING<br/>INTERACTIONS_STAGING]
+        I2 --> |Merge| B2
+        I2 --> |Merge| B3
+        I2 --> |Merge| B4
+        
+        B2 -.->|Auto Refresh| F1
+        B3 -.->|Auto Refresh| F1
+        B3 -.->|Auto Refresh| F2
+        B4 -.->|Auto Refresh| F3
+        
+        H1 --> |fs.retrieve_feature_values| I3[Read Feature Views:<br/>RFM_FEATURES<br/>PURCHASE_PATTERNS<br/>ENGAGEMENT_FEATURES]
+        F1 -.-> I3
+        F2 -.-> I3
+        F3 -.-> I3
+        
+        I3 --> I4[Model Scoring<br/>Python Pipeline]
+        I4 --> I5[(CONTINUOUS_CLV_PREDICTIONS<br/>Table<br/>Scheduled Update)]
     end
     
     subgraph "MODEL DEPLOYMENT"
@@ -151,12 +164,18 @@ graph TB
    - Metrics: RMSE, MAE, R², MAPE
    - HPO: 20 trials, Bayesian optimization
 
-4. **Inference** (Dynamic Tables)
-   - Staging: 
+4. **Inference** (Feature Store Integration)
+   - Staging tables for new data:
      - `CONTINUOUS_TRANSACTIONS_STAGING`
      - `CONTINUOUS_INTERACTIONS_STAGING`
-   - Feature Aggregation: `CONTINUOUS_CUSTOMER_FEATURES` (1 hour, incremental)
-   - Predictions: `CONTINUOUS_CLV_PREDICTIONS` (1 hour refresh)
+   - New data merged into base tables → Feature views auto-refresh (1 day)
+   - Inference via `fs.retrieve_feature_values()` using **same** feature views as training:
+     - `RFM_FEATURES` (v1.0)
+     - `PURCHASE_PATTERNS` (v1.0)
+     - `ENGAGEMENT_FEATURES` (v1.0)
+   - Model scoring in Python with full pipeline
+   - Output: `CONTINUOUS_CLV_PREDICTIONS` table
+   - **Key benefit**: Zero training-serving skew - identical feature logic
 
 ---
 
@@ -175,10 +194,14 @@ graph TB
 - **Regularization**: Tree depth limits, subsampling, L1/L2 penalties
 - **Deployment**: Both WAREHOUSE (SQL) and SPCS (Python) platforms
 
-### Inference Pattern
-- **Staging Tables**: Ingest new customer data
-- **Dynamic Tables**: Auto-refresh aggregations and predictions
-- **SQL-Based**: Native Snowflake model invocation via `MODEL!PREDICT()`
+### Inference Pattern (Feature Store)
+- **Staging Tables**: Ingest new transaction/interaction data
+- **Base Tables**: Merge/append staging data to CONTINUOUS_TRANSACTIONS, CONTINUOUS_INTERACTIONS
+- **Feature Store**: Feature views automatically refresh (1-day schedule)
+- **Retrieve Features**: `fs.retrieve_feature_values()` using same feature views as training
+- **Model Scoring**: Python pipeline prediction (scheduled notebook execution)
+- **Output Table**: CONTINUOUS_CLV_PREDICTIONS with predictions and timestamps
+- **Consistency**: Guaranteed identical features for training and inference
 
 ---
 
